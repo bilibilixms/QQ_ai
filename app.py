@@ -109,6 +109,15 @@ def ensure_group(conn: sqlite3.Connection, group_id: str) -> sqlite3.Row:
     return row
 
 
+def delete_group_data(group_id: str) -> None:
+    """Remove all persisted state for a group after the bot leaves it."""
+    with closing(db()) as conn:
+        conn.execute("DELETE FROM messages WHERE group_id=?", (group_id,))
+        conn.execute("DELETE FROM groups WHERE group_id=?", (group_id,))
+        conn.commit()
+    log.info("已清理退出群聊 %s 的配置和消息", group_id)
+
+
 def extract_text(message: Any) -> str:
     if isinstance(message, str):
         return message
@@ -299,6 +308,13 @@ async def send_group_message(ws: WebSocket, group_id: str, message: str) -> None
 
 
 async def handle_event(ws: WebSocket, event: dict) -> None:
+    if event.get("post_type") == "notice" and event.get("notice_type") == "group_decrease":
+        group_id = str(event.get("group_id", ""))
+        user_id = str(event.get("user_id", ""))
+        self_id = str(event.get("self_id", ""))
+        if group_id and user_id and user_id == self_id:
+            delete_group_data(group_id)
+        return
     if event.get("post_type") != "message" or event.get("message_type") != "group":
         return
     if str((event.get("sender") or {}).get("user_id", "")) == str(event.get("self_id", "")):
