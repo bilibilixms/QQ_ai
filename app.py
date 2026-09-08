@@ -23,6 +23,8 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("qq-fishing")
 DB_PATH = Path(os.getenv("DB_PATH", "data/bot.sqlite3"))
 FISH_COST, INITIAL_POINTS, DAILY_LIMIT, COOLDOWN_SECONDS = 5, 100, 3, 300
+CASTS_PER_TRIP, XP_PER_CAST, MAX_LEVEL = 3, 10, 7
+MAPS = {"林间小溪": {"cost": 0, "description": "清澈的小溪，适合新手。"}}
 SELL_ORDER_TTL = 300
 FISH_VALUES = {"小鲫鱼": 5, "草鱼": 8, "鲤鱼": 10, "彩虹锦鲤": 20, "金鱼": 25, "龙鱼": 50, "斗鱼": 60, "深海神龙鱼": 200}
 OUTCOMES = [("fish", "小鲫鱼", 60), ("fish", "草鱼", 12.5), ("fish", "鲤鱼", 12.5), ("fish", "彩虹锦鲤", 5), ("fish", "金鱼", 5), ("fish", "龙鱼", 2), ("fish", "斗鱼", 2), ("fish", "深海神龙鱼", 1), ("empty", "空竿", 8), ("points", 0.5, 5), ("points", 2, 3), ("points", 10, 0.2)]
@@ -40,6 +42,10 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS sell_orders (order_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, qq_id TEXT NOT NULL, status TEXT NOT NULL, items TEXT NOT NULL DEFAULT '{}', total INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_sell_orders_user ON sell_orders(group_id,qq_id,status);
         """); conn.commit()
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        for name, definition in (("level", "INTEGER NOT NULL DEFAULT 1"), ("experience", "INTEGER NOT NULL DEFAULT 0"), ("current_map", "TEXT NOT NULL DEFAULT '林间小溪'"), ("map_casts", "INTEGER NOT NULL DEFAULT 0")):
+            if name not in columns: conn.execute(f"ALTER TABLE users ADD COLUMN {name} {definition}")
+        conn.commit()
 
 def now_ts() -> int: return int(time.time())
 def today() -> str: return datetime.now().date().isoformat()
@@ -79,10 +85,43 @@ def register(group_id: str, qq_id: str, name: str) -> str:
     return f"注册成功！初始积分 {INITIAL_POINTS} 分。"
 
 def user(conn, group_id: str, qq_id: str): return conn.execute("SELECT * FROM users WHERE group_id=? AND qq_id=?", (group_id,qq_id)).fetchone()
+def xp_to_next(level: int) -> int:
+    if level >= MAX_LEVEL: return 0
+    return level * (150 if level >= 5 else 100)
+
+def level_text(level: int, experience: int) -> str:
+    if level >= MAX_LEVEL: return f"当前等级：7级\n经验：{experience}\n已达到最高等级。"
+    return f"当前等级：{level}级\n经验：{experience}\n距离下一级还需：{xp_to_next(level)}点经验。"
+
+def map_list_text() -> str:
+    return "可选地图：\n" + "\n".join(f"- {name}（门票 {data['cost']} 积分）{data['description']}" for name, data in MAPS.items()) + "\n发送“选择地图 地图名”进入。"
+
+def enter_map(group_id: str, qq_id: str, map_name: str) -> str:
+    map_name = map_name.strip()
+    if map_name not in MAPS: return f"暂未开放地图“{map_name}”。\n{map_list_text()}"
+    with closing(db()) as conn:
+        u = user(conn, group_id, qq_id)
+        if u is None: return "你还没有注册，请先发送“注册”。"
+        cost = MAPS[map_name]["cost"]
+        if u["current_map"] == map_name and u["map_casts"] < CASTS_PER_TRIP:
+            return f"你已经在【{map_name}】，本次旅程还可抛竿 {CASTS_PER_TRIP-u['map_casts']} 次。"
+        if u["points"] < cost: return f"积分不足，进入【{map_name}】需要 {cost} 分，你当前有 {u['points']} 分。"
+        conn.execute("UPDATE users SET points=points-?,current_map=?,map_casts=0 WHERE group_id=? AND qq_id=?", (cost, map_name, group_id, qq_id)); conn.commit()
+    return f"已进入【{map_name}】（消耗 {cost} 积分）。本次可抛竿 {CASTS_PER_TRIP} 次。"
+
+def add_experience(conn, group_id: str, qq_id: str, amount: int) -> tuple[int, int, int]:
+    row = user(conn, group_id, qq_id)
+    level, experience = int(row["level"]), int(row["experience"]) + amount
+    gained = 0
+    while level < MAX_LEVEL and experience >= xp_to_next(level):
+        experience -= xp_to_next(level); level += 1; gained += 1
+    conn.execute("UPDATE users SET level=?,experience=? WHERE group_id=? AND qq_id=?", (level, experience, group_id, qq_id))
+    return level, experience, gained
 def fish_once(group_id: str, qq_id: str, owner: bool) -> str:
     with closing(db()) as conn:
         u = user(conn,group_id,qq_id)
         if u is None: return "你还没有注册，请先发送“注册”。"
+        if u["map_casts"] >= CASTS_PER_TRIP: return f"你已完成【{u['current_map']}】本次旅程的 {CASTS_PER_TRIP} 次抛竿，请重新选择地图。"
         if u["daily_fish_date"] != today():
             conn.execute("UPDATE users SET daily_fish_count=0,daily_fish_date=? WHERE group_id=? AND qq_id=?", (today(),group_id,qq_id)); u = user(conn,group_id,qq_id)
         if u["points"] < FISH_COST: return f"积分不足，钓鱼需要 {FISH_COST} 分，你当前有 {u['points']} 分。"
@@ -98,9 +137,14 @@ def fish_once(group_id: str, qq_id: str, owner: bool) -> str:
         elif kind == "points":
             reward=int(FISH_COST*float(value)); conn.execute("UPDATE users SET points=points+? WHERE group_id=? AND qq_id=?", (reward,group_id,qq_id)); detail=f"获得积分奖励 {reward} 分。"
         else: detail="这次是空竿，没有额外收益。"
+        level, experience, levelups = add_experience(conn, group_id, qq_id, XP_PER_CAST)
+        casts = int(u["map_casts"]) + 1
+        conn.execute("UPDATE users SET map_casts=? WHERE group_id=? AND qq_id=?", (casts, group_id, qq_id))
         conn.commit(); points=conn.execute("SELECT points FROM users WHERE group_id=? AND qq_id=?", (group_id,qq_id)).fetchone()[0]
-    return f"{detail}\n消耗 {FISH_COST} 分，当前积分 {points} 分。" + ("" if owner else f"今日已钓 {count}/{DAILY_LIMIT} 次。")
-
+    trip = f"本次【{u['current_map']}】已抛竿 {casts}/{CASTS_PER_TRIP} 次。"
+    if casts >= CASTS_PER_TRIP: trip += "本次旅程结束，请重新选择地图。"
+    levelup = f"恭喜升级到 {level} 级！" if levelups else ""
+    return f"{detail}\n消耗 {FISH_COST} 分，获得 {XP_PER_CAST} 点经验。当前等级 {level} 级（经验 {experience}）。\n{trip}\n{levelup}" + ("" if owner else f"今日已钓 {count}/{DAILY_LIMIT} 次。")
 def inventory_rows(group_id: str, qq_id: str):
     with closing(db()) as conn: rows=conn.execute("SELECT fish_name,quantity FROM fish_inventory WHERE group_id=? AND qq_id=? AND quantity>0 ORDER BY fish_name", (group_id,qq_id)).fetchall()
     return list(rows)
@@ -146,6 +190,14 @@ def leaderboard(group_id):
         for u in users:
             rows=conn.execute("SELECT fish_name,quantity FROM fish_inventory WHERE group_id=? AND qq_id=? AND quantity>0", (group_id,u["qq_id"])).fetchall(); scores.append((sum(FISH_VALUES[r["fish_name"]]*r["quantity"] for r in rows),u["nickname"] or u["qq_id"],u["qq_id"]))
     scores.sort(key=lambda x:(-x[0],x[2])); return "本群暂无注册用户。" if not scores else "本群鱼塘排行（仅统计鱼塘积分）：\n"+"\n".join(f"{i}. {n}（{q}）— {s} 分" for i,(s,n,q) in enumerate(scores[:10],1))
+def player_leaderboard(group_id: str) -> str:
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT nickname,qq_id,level,experience,points FROM users WHERE group_id=? ORDER BY level DESC, experience DESC, points DESC, qq_id", (group_id,)).fetchall()
+    if not rows: return "本群暂无注册用户。"
+    return "本群等级排名：\n" + "\n".join(f"{i}. {r['nickname'] or r['qq_id']}（{r['qq_id']}）— {r['level']}级，{r['experience']}经验" for i, r in enumerate(rows[:10], 1))
+
+def help_text() -> str:
+    return "钓鱼机器人玩法：\n1. 发送“注册”创建账号。\n2. 发送“地图列表”查看地图，发送“选择地图 林间小溪”进入。\n3. 进入地图后发送“钓鱼”，每次消耗 5 积分，每张地图最多抛竿 3 次。\n4. 钓到的鱼会放入鱼塘，可发送“查看我的鱼塘”“卖鱼”。\n5. 发送“查看个人等级”查看等级经验，发送“查看排名”查看本群等级排行。"
 def admin_points(group_id,target,action,amount):
     with closing(db()) as conn:
         u=user(conn,group_id,target)
@@ -159,8 +211,17 @@ def admin_points(group_id,target,action,amount):
 def delete_member_data(group_id,qq_id):
     with closing(db()) as conn: conn.execute("DELETE FROM sell_orders WHERE group_id=? AND qq_id=?", (group_id,qq_id)); conn.execute("DELETE FROM fish_inventory WHERE group_id=? AND qq_id=?", (group_id,qq_id)); conn.execute("DELETE FROM users WHERE group_id=? AND qq_id=?", (group_id,qq_id)); conn.commit()
 def delete_group_data(group_id):
-    with closing(db()) as conn: conn.execute("DELETE FROM sell_orders WHERE group_id=?", (group_id,)); conn.execute("DELETE FROM fish_inventory WHERE group_id=?", (group_id,)); conn.execute("DELETE FROM users WHERE group_id=?", (group_id,)); conn.commit()
-
+    """Delete every row owned by a group while preserving global tables."""
+    with closing(db()) as conn:
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+        for row in tables:
+            table = row["name"]
+            if table == "admin_auth":
+                continue
+            columns = {info[1] for info in conn.execute(f'PRAGMA table_info("{table}")').fetchall()}
+            if "group_id" in columns:
+                conn.execute(f'DELETE FROM "{table}" WHERE group_id=?', (group_id,))
+        conn.commit()
 async def handle_event(ws,event):
     if event.get("post_type")=="notice" and event.get("notice_type")=="group_decrease":
         gid=str(event.get("group_id","")); uid=str(event.get("user_id","")); delete_group_data(gid) if uid==str(event.get("self_id","")) else delete_member_data(gid,uid); return
@@ -171,6 +232,15 @@ async def handle_event(ws,event):
     m=re.search(r"(充值|扣减|清零)\s*(\d+)?\s*积分?",text)
     if m and targets: await send(ws,gid,admin_points(gid,targets[0],m.group(1),int(m.group(2)) if m.group(2) else None) if owner else "只有本群群主可以管理积分。"); return
     if text=="注册": await send(ws,gid,register(gid,uid,nickname(event))); return
+    if text in {"介绍", "玩法", "帮助", "介绍/玩法"}: await send(ws,gid,help_text()); return
+    if text in {"地图列表", "查看地图", "地图"}: await send(ws,gid,map_list_text()); return
+    m_map=re.match(r"(?:选择地图|进入地图)\s*(.+)", text)
+    if m_map: await send(ws,gid,enter_map(gid,uid,m_map.group(1))); return
+    if text in {"查看个人等级", "我的等级", "查看等级"}:
+        with closing(db()) as conn:
+            u=user(conn,gid,uid); msg="你还没有注册，请先发送“注册”。" if u is None else level_text(int(u["level"]),int(u["experience"]))
+        await send(ws,gid,msg); return
+    if text in {"查看排名", "等级排行", "排名"}: await send(ws,gid,player_leaderboard(gid)); return
     if text in {"钓鱼","开始钓鱼"}: await send(ws,gid,"正在垂钓中，请稍候"); await send(ws,gid,fish_once(gid,uid,owner)); return
     if text in {"查看我的鱼塘","我的鱼塘","查看鱼塘"}:
         with closing(db()) as conn: msg="你还没有注册，请先发送“注册”。" if user(conn,gid,uid) is None else inventory_text(gid,uid)
